@@ -88,9 +88,6 @@ class AgentLoop:
             model=self.model,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
-            brave_api_key=brave_api_key,
-            exec_config=self.exec_config,
-            restrict_to_workspace=restrict_to_workspace,
         )
 
         self._running = False
