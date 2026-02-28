@@ -60,6 +60,10 @@ class SubagentInfo:
     tool_names: list[str] = field(default_factory=list)
     origin: dict[str, str] = field(default_factory=dict)
     session_key: str | None = None
+    persistent: bool = False  # True = LISTENER/PERSISTENT，不会因 LLM 回复而退出
+
+    # 运行时消息列表 (与 _run_subagent 内的 messages 共享引用, 供 Dashboard 读取)
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
     # 主 agent -> 子 agent 的消息收件箱
     inbox: asyncio.Queue[str] = field(default_factory=lambda: asyncio.Queue())
@@ -137,6 +141,7 @@ class SubagentManager:
         origin_channel: str = "cli",
         origin_chat_id: str = "direct",
         session_key: str | None = None,
+        persistent: bool = False,
     ) -> str:
         """创建并启动一个子 agent。"""
         task_id = str(uuid.uuid4())[:8]
@@ -152,17 +157,30 @@ class SubagentManager:
         # 构建子 agent 的工具注册表
         tool_registry = self._build_tool_registry(tools)
 
+        # 验证模型可用性，不可用则回退到默认模型
+        resolved_model = model or self.default_model
+        if model and hasattr(self.provider, 'cfg'):
+            src_idx = self.provider.cfg.find_source_for_model(model)
+            if src_idx is None:
+                logger.warning(
+                    "Subagent model '{}' not found in any enabled source, "
+                    "falling back to default '{}'",
+                    model, self.default_model,
+                )
+                resolved_model = self.default_model
+
         # 创建子 agent 状态
         info = SubagentInfo(
             task_id=task_id,
             task=task,
             label=display_label,
-            model=model or self.default_model,
+            model=resolved_model,
             report_mode=mode,
             max_iterations=max_iterations,
             tool_names=tool_registry.tool_names,
             origin=origin,
             session_key=session_key,
+            persistent=persistent,
         )
         self._agents[task_id] = info
 
@@ -175,11 +193,18 @@ class SubagentManager:
             self._session_tasks.setdefault(session_key, set()).add(task_id)
 
         def _cleanup(_: asyncio.Task) -> None:
-            self._running_tasks.pop(task_id, None)
-            if session_key and (ids := self._session_tasks.get(session_key)):
-                ids.discard(task_id)
-                if not ids:
-                    del self._session_tasks[session_key]
+            # persistent agent 完成后不从跟踪表中移除（保留可查询状态）
+            if not persistent:
+                self._running_tasks.pop(task_id, None)
+                if session_key and (ids := self._session_tasks.get(session_key)):
+                    ids.discard(task_id)
+                    if not ids:
+                        del self._session_tasks[session_key]
+            else:
+                logger.info(
+                    "Persistent subagent [{}] bg_task ended, keeping in registry",
+                    task_id,
+                )
 
         bg_task.add_done_callback(_cleanup)
 
@@ -258,6 +283,56 @@ class SubagentManager:
 
     # ── 查询 ──────────────────────────────────────────────────────
 
+    def update_agent(
+        self,
+        task_id: str,
+        *,
+        report_mode: str | None = None,
+        model: str | None = None,
+        max_iterations: int | None = None,
+    ) -> str:
+        """动态更新运行中子 agent 的参数。
+
+        可更新字段: report_mode, model, max_iterations。
+        下次 LLM 迭代时立即生效。
+        """
+        info = self._agents.get(task_id)
+        if not info:
+            return f"Error: subagent {task_id} not found"
+        if info.state not in (SubagentState.RUNNING, SubagentState.PAUSED):
+            return f"Error: subagent {task_id} is {info.state.value}, cannot update"
+
+        changes: list[str] = []
+
+        if report_mode is not None:
+            try:
+                new_mode = ReportMode(report_mode)
+                old_mode = info.report_mode
+                info.report_mode = new_mode
+                changes.append(f"report_mode: {old_mode.value} → {new_mode.value}")
+            except ValueError:
+                return f"Error: invalid report_mode '{report_mode}'"
+
+        if model is not None:
+            old_model = info.model
+            info.model = model
+            changes.append(f"model: {old_model} → {model}")
+
+        if max_iterations is not None:
+            old_max = info.max_iterations
+            info.max_iterations = max_iterations
+            changes.append(f"max_iterations: {old_max} → {max_iterations}")
+
+        if not changes:
+            return f"No changes specified for subagent [{info.label}]"
+
+        logger.info(
+            "Updated subagent [{}]: {}", task_id, ", ".join(changes),
+        )
+        return (
+            f"Subagent [{info.label}] updated: {'; '.join(changes)}"
+        )
+
     def list_agents(self) -> list[dict[str, Any]]:
         """列出所有子 agent 及其状态。"""
         result = []
@@ -313,6 +388,8 @@ class SubagentManager:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": info.task},
             ]
+            # 将消息列表引用存到 info 上, 供外部 (Dashboard) 读取
+            info.messages = messages
 
             final_result: str | None = None
 
@@ -368,11 +445,14 @@ class SubagentManager:
                         }
                         for tc in response.tool_calls
                     ]
-                    messages.append({
+                    assistant_msg: dict[str, Any] = {
                         "role": "assistant",
                         "content": response.content or "",
                         "tool_calls": tool_call_dicts,
-                    })
+                    }
+                    if response.reasoning_content:
+                        assistant_msg["reasoning_content"] = response.reasoning_content
+                    messages.append(assistant_msg)
 
                     # 执行工具并收集结果
                     tool_results: list[tuple[str, str]] = []
@@ -408,6 +488,15 @@ class SubagentManager:
                         await self._report_progress(info, progress_text)
 
                 elif response.content:
+                    # 将 assistant 回复追加到 messages（供 Dashboard 展示）
+                    assistant_reply: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": response.content,
+                    }
+                    if response.reasoning_content:
+                        assistant_reply["reasoning_content"] = response.reasoning_content
+                    messages.append(assistant_reply)
+
                     # 进度回传: every_step
                     if info.report_mode == ReportMode.EVERY_STEP:
                         preview = response.content[:300]
@@ -419,15 +508,59 @@ class SubagentManager:
                             f"Thinking: {preview}",
                         )
 
-                    # 无工具调用 = 最终回答
-                    final_result = response.content
-                    break
+                    if info.persistent:
+                        # ── persistent agent: 不退出，将结果推送给父 agent 后等待新指令 ──
+                        await self._deliver_persistent_result(
+                            info, response.content,
+                        )
+                        logger.info(
+                            "Persistent subagent [{}] entering idle wait",
+                            task_id,
+                        )
+                        # 阻塞等待 inbox 消息（取消时会抛出 CancelledError）
+                        try:
+                            msg = await info.inbox.get()
+                        except asyncio.CancelledError:
+                            raise
+                        messages.append({
+                            "role": "user",
+                            "content": f"[New instruction]: {msg}",
+                        })
+                        logger.info(
+                            "Persistent subagent [{}] woke up: {}",
+                            task_id, msg[:100],
+                        )
+                        # 重置迭代计数器，防止 idle 唤醒后被 max_iterations 限制
+                        info.iteration = 0
+                        continue
+                    else:
+                        # 普通 agent: 无工具调用 = 最终回答
+                        final_result = response.content
+                        break
                 else:
-                    # 空响应
-                    final_result = (
-                        "Task completed but no final response was generated."
-                    )
-                    break
+                    if info.persistent:
+                        # persistent agent 空响应也不退出
+                        logger.warning(
+                            "Persistent subagent [{}] got empty response, "
+                            "waiting for inbox",
+                            task_id,
+                        )
+                        try:
+                            msg = await info.inbox.get()
+                        except asyncio.CancelledError:
+                            raise
+                        messages.append({
+                            "role": "user",
+                            "content": f"[New instruction]: {msg}",
+                        })
+                        info.iteration = 0
+                        continue
+                    else:
+                        # 空响应
+                        final_result = (
+                            "Task completed but no final response was generated."
+                        )
+                        break
 
             # ── 循环结束 ──
             if info.state == SubagentState.CANCELLED:
@@ -459,6 +592,67 @@ class SubagentManager:
                 )
 
             await self._announce_result(info, error_msg, "error")
+
+    # ── 持久 agent 结果推送 ───────────────────────────────────────
+
+    async def _deliver_persistent_result(
+        self,
+        info: SubagentInfo,
+        content: str,
+    ) -> None:
+        """持久 agent 产出 content-only 响应时，将结果推送给父 agent。
+
+        与 _announce_result 类似，但不标记 agent 为 completed。
+        同时写入 EventLog 并通过 bus 发送 wake 消息触发父 agent LLM 轮。
+        """
+        parent_session_key = (
+            f"{info.origin['channel']}:{info.origin['chat_id']}"
+            if info.origin else None
+        )
+
+        result_text = (
+            f"[Persistent agent '{info.label}' produced a result]\n\n"
+            f"{content}"
+        )
+
+        # 写入 EventLog (RESULT 类型)
+        event_log = self._resolve_event_log(parent_session_key)
+        if event_log is not None:
+            event_log.append(RealtimeEvent.create(
+                source_id=info.task_id,
+                source_label=info.label,
+                event_type=RealtimeEventType.RESULT,
+                payload=result_text,
+                task_id=info.task_id,
+                iteration=info.iteration,
+                max_iterations=info.max_iterations,
+                status="delivering",
+            ))
+
+        # wake: 注入 InboundMessage 触发父 agent LLM 轮
+        wake_content = (
+            f"[Persistent agent '{info.label}' has produced a result]\n\n"
+            f"Result:\n{content}\n\n"
+            f"This agent is still running and waiting for new instructions. "
+            f"Summarize the result naturally for the user."
+        )
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id=f"{info.origin['channel']}:{info.origin['chat_id']}",
+            content=wake_content,
+            metadata={
+                "_subagent_result": True,
+                "_persistent_delivery": True,
+                "task_id": info.task_id,
+            },
+            session_key_override=parent_session_key,
+        )
+        await self.bus.publish_inbound(msg)
+        logger.info(
+            "Persistent subagent [{}] delivered result to parent (session: {})",
+            info.task_id, parent_session_key,
+        )
 
     # ── 进度回传 ──────────────────────────────────────────────────
 
