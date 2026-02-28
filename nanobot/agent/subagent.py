@@ -35,6 +35,8 @@ class ReportMode(str, Enum):
     ON_ERROR = "on_error"             # 出错时 + 最终结果
     ON_TOOL_CALL = "on_tool_call"     # 每次工具调用 + 最终结果
     EVERY_STEP = "every_step"         # 每轮 LLM 迭代 + 最终结果
+    SILENT = "silent"                 # 完全静默，不写 EventLog 也不唤醒父 agent
+    PEER_ONLY = "peer_only"           # 仅写 EventLog，绝不唤醒父 agent (InboundMessage)
 
 
 class SubagentState(str, Enum):
@@ -61,6 +63,7 @@ class SubagentInfo:
     origin: dict[str, str] = field(default_factory=dict)
     session_key: str | None = None
     persistent: bool = False  # True = LISTENER/PERSISTENT，不会因 LLM 回复而退出
+    depth: int = 0  # 嵌套深度: 顶层=0, 子agent=1, 孙agent=2, ...
 
     # 运行时消息列表 (与 _run_subagent 内的 messages 共享引用, 供 Dashboard 读取)
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -79,10 +82,12 @@ class SubagentInfo:
 class SubagentManager:
     """管理后台子 agent 的创建、执行、通信和生命周期。"""
 
-    # 子 agent 永远不能拥有的工具 (防止无限递归)
-    _EXCLUDED_TOOLS = frozenset({
+    # spawn 管理类工具 — 在嵌套深度未达上限时允许子 agent 使用
+    _SPAWN_TOOLS = frozenset({
         "spawn", "subagent_message", "subagent_list", "subagent_control",
     })
+    # 嵌套 spawn 的最大深度: 0=顶层, 1=子agent, 2=孙agent
+    MAX_SPAWN_DEPTH = 2
 
     def __init__(
         self,
@@ -142,8 +147,14 @@ class SubagentManager:
         origin_chat_id: str = "direct",
         session_key: str | None = None,
         persistent: bool = False,
+        depth: int = 0,
     ) -> str:
-        """创建并启动一个子 agent。"""
+        """创建并启动一个子 agent。
+
+        Args:
+            depth: 嵌套深度。顶层=0，子agent=1（可继续spawn），
+                   depth >= MAX_SPAWN_DEPTH 时不再赋予 spawn 工具。
+        """
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
@@ -154,8 +165,8 @@ class SubagentManager:
         except ValueError:
             mode = ReportMode.RESULT_ONLY
 
-        # 构建子 agent 的工具注册表
-        tool_registry = self._build_tool_registry(tools)
+        # 构建子 agent 的工具注册表 (按 depth 决定是否包含 spawn 管理工具)
+        tool_registry = self._build_tool_registry(tools, depth=depth)
 
         # 验证模型可用性，不可用则回退到默认模型
         resolved_model = model or self.default_model
@@ -181,6 +192,7 @@ class SubagentManager:
             origin=origin,
             session_key=session_key,
             persistent=persistent,
+            depth=depth,
         )
         self._agents[task_id] = info
 
@@ -347,6 +359,7 @@ class SubagentManager:
                 "tools": info.tool_names,
                 "recent_tools_used": info.tools_used[-5:],
                 "has_pending_messages": not info.inbox.empty(),
+                "depth": info.depth,
             })
         return result
 
@@ -418,7 +431,10 @@ class SubagentManager:
                     except asyncio.QueueEmpty:
                         break
 
-                info.iteration += 1
+                # 如果注入了纠正消息，不消耗迭代配额
+                # (纠正是外部干预，不应算作 agent 自身的一次工作迭代)
+                if not corrections_injected:
+                    info.iteration += 1
 
                 # ── LLM 调用 ──
                 tool_defs = tools.get_definitions() if tools.tool_names else None
@@ -604,18 +620,31 @@ class SubagentManager:
 
         与 _announce_result 类似，但不标记 agent 为 completed。
         同时写入 EventLog 并通过 bus 发送 wake 消息触发父 agent LLM 轮。
+
+        report_mode 行为:
+        - SILENT: 不写 EventLog 也不 wake。完全靠 peer_send 通信。
+        - PEER_ONLY: 仅写 EventLog，不 wake 父 agent。
+        - 其他: 写 EventLog + wake 父 agent。
         """
         parent_session_key = (
             f"{info.origin['channel']}:{info.origin['chat_id']}"
             if info.origin else None
         )
 
+        # SILENT: 完全静默
+        if info.report_mode == ReportMode.SILENT:
+            logger.debug(
+                "Persistent subagent [{}] result suppressed (silent mode)",
+                info.task_id,
+            )
+            return
+
         result_text = (
             f"[Persistent agent '{info.label}' produced a result]\n\n"
             f"{content}"
         )
 
-        # 写入 EventLog (RESULT 类型)
+        # 写入 EventLog (RESULT 类型) — PEER_ONLY 和其他模式都写
         event_log = self._resolve_event_log(parent_session_key)
         if event_log is not None:
             event_log.append(RealtimeEvent.create(
@@ -628,6 +657,14 @@ class SubagentManager:
                 max_iterations=info.max_iterations,
                 status="delivering",
             ))
+
+        # PEER_ONLY: 仅 EventLog，不 wake
+        if info.report_mode == ReportMode.PEER_ONLY:
+            logger.debug(
+                "Persistent subagent [{}] result to EventLog only (peer_only mode)",
+                info.task_id,
+            )
+            return
 
         # wake: 注入 InboundMessage 触发父 agent LLM 轮
         wake_content = (
@@ -661,7 +698,15 @@ class SubagentManager:
 
         优先走 EventLog 快路径（O(1)，不触发 LLM）；
         若 EventLog 不可用则回退到 bus.publish_inbound()。
+
+        report_mode 行为:
+        - SILENT: 完全跳过。
+        - PEER_ONLY: 仅写 EventLog，不回退到 InboundMessage。
         """
+        # SILENT 模式: 完全跳过
+        if info.report_mode == ReportMode.SILENT:
+            return
+
         parent_session_key = (
             f"{info.origin['channel']}:{info.origin['chat_id']}"
             if info.origin else None
@@ -682,6 +727,14 @@ class SubagentManager:
             logger.debug(
                 "Subagent [{}] progress → event_log (session: {})",
                 info.task_id, parent_session_key,
+            )
+            return
+
+        # PEER_ONLY 模式: 不回退到 InboundMessage
+        if info.report_mode == ReportMode.PEER_ONLY:
+            logger.debug(
+                "Subagent [{}] progress suppressed (peer_only, no EventLog)",
+                info.task_id,
             )
             return
 
@@ -713,12 +766,24 @@ class SubagentManager:
 
         默认走 EventLog 快路径 + wake（触发父 agent LLM 轮）。
         若 EventLog 不可用则回退到 bus.publish_inbound()。
+
+        report_mode 行为:
+        - SILENT: 不写 EventLog 也不 wake。
+        - PEER_ONLY: 仅写 EventLog，不 wake。
+        - 其他: EventLog + wake。
         """
         status_text = "completed successfully" if status == "ok" else "failed"
         parent_session_key = (
             f"{info.origin['channel']}:{info.origin['chat_id']}"
             if info.origin else None
         )
+
+        # SILENT: 完全跳过
+        if info.report_mode == ReportMode.SILENT:
+            logger.debug(
+                "Subagent [{}] result suppressed (silent mode)", info.task_id,
+            )
+            return
 
         announce_content = (
             f"[Subagent '{info.label}' {status_text}]\n\n"
@@ -746,6 +811,14 @@ class SubagentManager:
                 info.task_id, parent_session_key,
             )
 
+        # PEER_ONLY: 仅 EventLog，不 wake
+        if info.report_mode == ReportMode.PEER_ONLY:
+            logger.debug(
+                "Subagent [{}] result to EventLog only (peer_only mode)",
+                info.task_id,
+            )
+            return
+
         # wake: 注入 InboundMessage 触发父 agent LLM 轮
         wake_content = (
             f"[Subagent '{info.label}' {status_text}]\n\n"
@@ -770,34 +843,78 @@ class SubagentManager:
     # ── 工具注册表构建 ────────────────────────────────────────────
 
     def _build_tool_registry(
-        self, requested_tools: list[str] | None,
+        self, requested_tools: list[str] | None, depth: int = 0,
     ) -> ToolRegistry:
-        """为子 agent 构建筛选后的工具注册表。"""
+        """为子 agent 构建筛选后的工具注册表。
+
+        Args:
+            requested_tools: 明确请求的工具列表，为 None 时包含所有父工具。
+            depth: 当前嵌套深度。当 depth >= MAX_SPAWN_DEPTH 时，
+                   spawn 管理类工具 (_SPAWN_TOOLS) 被排除，防止无限递归。
+        """
+        from nanobot.agent.tools.spawn import SpawnTool
         registry = ToolRegistry()
 
         if self.parent_tools is None:
             return registry
 
+        # 深度达到上限时排除 spawn 管理类工具
+        excluded = self._SPAWN_TOOLS if depth >= self.MAX_SPAWN_DEPTH else frozenset()
+        if depth < self.MAX_SPAWN_DEPTH:
+            logger.info(
+                "Subagent depth={}/{}: spawn tools ALLOWED",
+                depth, self.MAX_SPAWN_DEPTH,
+            )
+        else:
+            logger.info(
+                "Subagent depth={}/{}: spawn tools EXCLUDED (max depth reached)",
+                depth, self.MAX_SPAWN_DEPTH,
+            )
+
+        def _maybe_rebind(tool):
+            """如果是 SpawnTool 或其派生类，创建新实例并绑定正确的 depth。
+
+            子 agent 继承的 spawn 工具必须携带当前 depth，
+            这样孙 agent 的 depth+1 才能正确递增。
+            不能直接修改原工具实例（父 agent 还在使用）。
+            """
+            if isinstance(tool, SpawnTool):
+                new_tool = SpawnTool(self, depth=depth)
+                new_tool.set_context(
+                    tool._origin_channel, tool._origin_chat_id,
+                )
+                return new_tool
+            # EnhancedSpawnTool 等派生类: 通过 copy 创建独立副本
+            if hasattr(tool, '_depth') and tool.name == 'spawn':
+                import copy
+                new_tool = copy.copy(tool)
+                new_tool._depth = depth
+                return new_tool
+            return tool
+
         if requested_tools is not None:
-            # 仅包含明确请求的工具 (排除管理类工具)
             for name in requested_tools:
-                if name in self._EXCLUDED_TOOLS:
+                if name in excluded:
                     logger.warning(
-                        "Subagent cannot use excluded tool: {}", name,
+                        "Subagent (depth={}) cannot use spawn tool: {}",
+                        depth, name,
                     )
                     continue
                 tool = self.parent_tools.get(name)
                 if tool:
+                    if name in self._SPAWN_TOOLS:
+                        tool = _maybe_rebind(tool)
                     registry.register(tool)
                 else:
                     logger.warning("Subagent requested unknown tool: {}", name)
         else:
-            # 包含所有父工具 (排除管理类)
             for name in self.parent_tools.tool_names:
-                if name in self._EXCLUDED_TOOLS:
+                if name in excluded:
                     continue
                 tool = self.parent_tools.get(name)
                 if tool:
+                    if name in self._SPAWN_TOOLS:
+                        tool = _maybe_rebind(tool)
                     registry.register(tool)
 
         return registry

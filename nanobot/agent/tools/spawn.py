@@ -25,8 +25,9 @@ if TYPE_CHECKING:
 class SpawnTool(Tool):
     """Spawn a subagent with fully configurable parameters."""
 
-    def __init__(self, manager: SubagentManager):
+    def __init__(self, manager: SubagentManager, depth: int = 0):
         self._manager = manager
+        self._depth = depth  # 当前嵌套深度，子 agent spawn 时传递 depth+1
         self._origin_channel = "cli"
         self._origin_chat_id = "direct"
         self._session_key = "cli:direct"
@@ -153,6 +154,7 @@ class SpawnTool(Tool):
             origin_channel=self._origin_channel,
             origin_chat_id=self._origin_chat_id,
             session_key=self._session_key,
+            depth=self._depth + 1,
         )
 
 
