@@ -73,6 +73,12 @@ class SubagentInfo:
     # 暂停控制 (set = 运行中, clear = 已暂停)
     pause_event: asyncio.Event = field(default_factory=lambda: asyncio.Event())
 
+    # ── Token 追踪 (用于触发上下文精简) ──
+    total_prompt_tokens: int = 0       # 累计 prompt token 消耗
+    total_completion_tokens: int = 0   # 累计 completion token 消耗
+    last_prompt_tokens: int = 0        # 最近一次 API 调用的 prompt_tokens
+    condensation_count: int = 0        # 已执行精简次数
+
     def __post_init__(self) -> None:
         self.pause_event.set()  # 默认不暂停
 
@@ -88,6 +94,14 @@ class SubagentManager:
     })
     # 嵌套 spawn 的最大深度: 0=顶层, 1=子agent, 2=孙agent
     MAX_SPAWN_DEPTH = 2
+
+    # ── Token 管理常量 ──
+    # 单条工具结果的最大字符数 — 超长结果截断以防上下文膨胀
+    _TOOL_RESULT_MAX_CHARS: int = 4000
+    # prompt_tokens 超过此值时触发上下文精简 (默认 80k, ~128k 上下文窗口的 62.5%)
+    _CONDENSE_TOKEN_THRESHOLD: int = 80_000
+    # 精简后保留的最近消息条数 (system_prompt 不计入)
+    _CONDENSE_KEEP_RECENT: int = 6
 
     def __init__(
         self,
@@ -380,6 +394,140 @@ class SubagentManager:
                 count += 1
         return count
 
+    # ── 上下文精简 (Token 感知) ─────────────────────────────────────
+
+    async def _condense_subagent_messages(
+        self,
+        info: SubagentInfo,
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """当 prompt_tokens 超过阈值时, 精简子 agent 的消息列表。
+
+        策略:
+        1. 保留 messages[0] (system prompt) 不动
+        2. 将中间的旧消息通过 LLM 总结为简洁摘要
+        3. 保留最近 _CONDENSE_KEEP_RECENT 条消息
+        4. 用 [summary_user_msg] 替换被删除的消息
+
+        这样做既保留了完整的系统提示和最近上下文,
+        又大幅缩减了 prompt_tokens, 防止 128k 上下文溢出。
+        """
+        keep = self._CONDENSE_KEEP_RECENT
+        # 至少需要 system + N 条旧消息 + keep 条新消息
+        if len(messages) <= keep + 2:
+            return messages
+
+        system_msg = messages[0]  # system prompt
+        # 需要总结的消息 = messages[1:-keep]
+        to_summarize = messages[1:-keep] if keep > 0 else messages[1:]
+        to_keep = messages[-keep:] if keep > 0 else []
+
+        if not to_summarize:
+            return messages
+
+        # 构建总结输入 — 每条消息取前 300 字符
+        summary_parts: list[str] = []
+        for msg in to_summarize:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, str) and content.strip():
+                truncated = content[:300] + ("..." if len(content) > 300 else "")
+                summary_parts.append(f"[{role}]: {truncated}")
+            elif role == "assistant" and msg.get("tool_calls"):
+                tc_names = [
+                    tc.get("function", {}).get("name", "?")
+                    for tc in msg["tool_calls"]
+                ]
+                summary_parts.append(f"[assistant]: called tools: {', '.join(tc_names)}")
+
+        if not summary_parts:
+            return messages
+
+        conversation_block = "\n".join(summary_parts)
+        # 限制总结输入长度, 避免总结请求本身超限
+        if len(conversation_block) > 6000:
+            conversation_block = conversation_block[:6000] + "\n... (truncated)"
+
+        condense_system = (
+            "You are a concise conversation summarizer. "
+            "Compress the following agent conversation into a brief summary (3-8 sentences). "
+            "Preserve: key findings, tool results, important decisions, errors encountered. "
+            "Omit: redundant tool calls, intermediate thinking, verbose tool outputs. "
+            "Output in the same language as the conversation."
+        )
+        condense_user = f"Summarize this agent conversation:\n\n{conversation_block}"
+
+        try:
+            # 使用当前子 agent 的模型进行总结 (或回退到默认)
+            condense_model = self.default_model
+            response = await self.provider.chat(
+                messages=[
+                    {"role": "system", "content": condense_system},
+                    {"role": "user", "content": condense_user},
+                ],
+                model=condense_model,
+                max_tokens=1024,
+                temperature=0.3,
+            )
+
+            summary = (response.content or "").strip()
+            if not summary:
+                logger.warning(
+                    "Subagent [{}] 上下文精简失败: LLM 返回空摘要, 跳过",
+                    info.task_id,
+                )
+                return messages
+
+            # 重建消息列表: system + summary_msg + 保留的最近消息
+            condensed: list[dict[str, Any]] = [system_msg]
+            condensed.append({
+                "role": "user",
+                "content": (
+                    f"[Context Summary — condensed from {len(to_summarize)} earlier messages]\n"
+                    f"{summary}\n\n"
+                    f"Continue working on the original task. "
+                    f"The above is a summary of your previous work."
+                ),
+            })
+            # 确保 to_keep 不以 tool 消息开头 (需要 assistant+tool_calls 前置)
+            while to_keep and to_keep[0].get("role") == "tool":
+                to_keep.pop(0)
+            condensed.extend(to_keep)
+
+            info.condensation_count += 1
+            old_count = len(messages)
+            logger.info(
+                "Subagent [{}] 上下文精简完成: {} → {} 条消息 | "
+                "总结 {} 条 | 保留 {} 条 | prompt_tokens 当前 {} | 精简次数 #{}",
+                info.task_id, old_count, len(condensed),
+                len(to_summarize), len(to_keep),
+                info.last_prompt_tokens, info.condensation_count,
+            )
+
+            # 更新 info.messages 引用 (Dashboard 需要)
+            messages.clear()
+            messages.extend(condensed)
+            return messages
+
+        except Exception as e:
+            logger.warning(
+                "Subagent [{}] 上下文精简异常: {} — 跳过精简, 继续执行",
+                info.task_id, e,
+            )
+            return messages
+
+    @staticmethod
+    def _truncate_tool_result(result: str, max_chars: int) -> str:
+        """截断过长的工具结果, 保留首尾部分。"""
+        if len(result) <= max_chars:
+            return result
+        half = max_chars // 2
+        return (
+            result[:half]
+            + f"\n\n... [truncated {len(result) - max_chars} chars] ...\n\n"
+            + result[-half:]
+        )
+
     # ── 核心执行循环 ──────────────────────────────────────────────
 
     async def _run_subagent(
@@ -446,6 +594,34 @@ class SubagentManager:
                     max_tokens=self.default_max_tokens,
                 )
 
+                # ── Token 追踪 ──
+                if response.usage:
+                    pt = response.usage.get("prompt_tokens", 0)
+                    ct = response.usage.get("completion_tokens", 0)
+                    info.total_prompt_tokens += pt
+                    info.total_completion_tokens += ct
+                    info.last_prompt_tokens = pt
+                    logger.debug(
+                        "Subagent [{}] tokens: prompt={}, completion={}, "
+                        "cumulative_prompt={}",
+                        task_id, pt, ct, info.total_prompt_tokens,
+                    )
+
+                    # ── Token 感知的上下文精简 ──
+                    # 当 prompt_tokens 超过阈值时触发精简,
+                    # 而非按调用轮数触发, 因为不同工具返回的数据量差异巨大。
+                    if pt > self._CONDENSE_TOKEN_THRESHOLD:
+                        logger.info(
+                            "Subagent [{}] prompt_tokens={} > 阈值 {}, "
+                            "触发上下文精简",
+                            task_id, pt, self._CONDENSE_TOKEN_THRESHOLD,
+                        )
+                        messages = await self._condense_subagent_messages(
+                            info, messages,
+                        )
+                        # 更新 info.messages 引用
+                        info.messages = messages
+
                 if response.has_tool_calls:
                     # 构建 assistant 消息
                     tool_call_dicts = [
@@ -479,11 +655,15 @@ class SubagentManager:
                             task_id, tc.name, args_str[:200],
                         )
                         result = await tools.execute(tc.name, tc.arguments)
+                        # 截断过长的工具结果, 防止上下文膨胀
+                        truncated_result = self._truncate_tool_result(
+                            result, self._TOOL_RESULT_MAX_CHARS,
+                        )
                         messages.append({
                             "role": "tool",
                             "tool_call_id": tc.id,
                             "name": tc.name,
-                            "content": result,
+                            "content": truncated_result,
                         })
                         info.tools_used.append(tc.name)
                         tool_results.append((tc.name, result))
