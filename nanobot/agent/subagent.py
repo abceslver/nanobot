@@ -1087,15 +1087,15 @@ class SubagentManager:
                     registry.register(tool)
                 else:
                     logger.warning("Subagent requested unknown tool: {}", name)
-        else:
-            for name in self.parent_tools.tool_names:
-                if name in excluded:
-                    continue
-                tool = self.parent_tools.get(name)
-                if tool:
-                    if name in self._SPAWN_TOOLS:
-                        tool = _maybe_rebind(tool)
-                    registry.register(tool)
+        # else:
+        #     for name in self.parent_tools.tool_names:
+        #         if name in excluded:
+        #             continue
+        #         tool = self.parent_tools.get(name)
+        #         if tool:
+        #             if name in self._SPAWN_TOOLS:
+        #                 tool = _maybe_rebind(tool)
+        #             registry.register(tool)
 
         return registry
 
