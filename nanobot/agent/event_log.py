@@ -130,6 +130,8 @@ class EventLog:
         max_payload_len: int = 500,
         merge_same_source: bool = True,
         drop_heartbeat: bool = True,
+        include_event_id: bool = False,
+        include_event_type: bool = False,
     ) -> str:
         """
         将事件列表压缩为可注入 context 的文本。
@@ -159,8 +161,12 @@ class EventLog:
             if len(payload) > max_payload_len:
                 payload = payload[:max_payload_len] + "..."
             type_icon = _EVENT_ICONS.get(e.event_type, "•")
+
+            # 可溯源增强：可选携带 event_id / event_type（默认关闭，避免影响现有上下文格式）
+            id_part = f"#{e.event_id}" if include_event_id else ""
+            type_part = f" ({e.event_type.value})" if include_event_type else ""
             lines.append(
-                f"[{e.timestamp:%H:%M:%S}] {type_icon} {e.source_label}: {payload}"
+                f"[{e.timestamp:%H:%M:%S}] {type_icon} {e.source_label}{id_part}{type_part}: {payload}"
             )
 
         return "\n".join(lines)
