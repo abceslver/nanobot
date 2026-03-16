@@ -14,6 +14,7 @@ import asyncio
 import json
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,8 @@ class SubagentInfo:
 
     # 运行时消息列表 (与 _run_subagent 内的 messages 共享引用, 供 Dashboard 读取)
     messages: list[dict[str, Any]] = field(default_factory=list)
+    report_file_path: str | None = None
+    unregister_on_finish: bool = False
 
     # 主 agent -> 子 agent 的消息收件箱
     inbox: asyncio.Queue[str] = field(default_factory=lambda: asyncio.Queue())
@@ -98,6 +101,7 @@ class SubagentManager:
     # ── Token 管理常量 ──
     # 单条工具结果的最大字符数 — 超长结果截断以防上下文膨胀
     _TOOL_RESULT_MAX_CHARS: int = 4000
+    _MISSION_COMPLETE_TOKEN: str = "MISSION_COMPLETE"
     # prompt_tokens 超过此值时触发上下文精简 (默认 80k, ~128k 上下文窗口的 62.5%)
     _CONDENSE_TOKEN_THRESHOLD: int = 80_000
     # 精简后保留的最近消息条数 (system_prompt 不计入)
@@ -128,6 +132,163 @@ class SubagentManager:
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._agents: dict[str, SubagentInfo] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
+
+    def _subagent_report_dir(self) -> Path:
+        """返回子 agent 报告缓存目录。"""
+        path = self.workspace / ".cache" / "subagents"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _slugify_label(label: str) -> str:
+        safe = [c if c.isalnum() or c in ("-", "_") else "_" for c in label.strip()]
+        text = "".join(safe).strip("_") or "task"
+        return text[:48]
+
+    def _build_report_path(self, info: SubagentInfo) -> Path:
+        filename = f"{info.task_id}_{self._slugify_label(info.label)}.jsonl"
+        return self._subagent_report_dir() / filename
+
+    def _report_relpath(self, info: SubagentInfo) -> str | None:
+        if not info.report_file_path:
+            return None
+        path = Path(info.report_file_path)
+        cache_root = self.workspace / ".cache"
+        try:
+            return str(path.resolve().relative_to(cache_root.resolve())).replace("\\", "/")
+        except Exception:
+            return str(path)
+
+    def _append_report_event(
+        self,
+        info: SubagentInfo,
+        event_type: str,
+        payload: Any,
+        **extra: Any,
+    ) -> None:
+        """将子 agent 的完整轨迹实时追加到缓存文件。"""
+        if not info.report_file_path:
+            return
+        try:
+            record = {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "task_id": info.task_id,
+                "label": info.label,
+                "state": info.state.value,
+                "iteration": info.iteration,
+                "event": event_type,
+                "payload": payload,
+            }
+            if extra:
+                record.update(extra)
+            with Path(info.report_file_path).open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning("Subagent [{}] 写入报告失败: {}", info.task_id, e)
+
+    @classmethod
+    def _extract_completion_signal(cls, content: str) -> tuple[bool, str]:
+        """解析最终输出中的任务完成终止符。"""
+        if not content:
+            return False, content
+        completed = cls._MISSION_COMPLETE_TOKEN in content
+        cleaned = content.replace(cls._MISSION_COMPLETE_TOKEN, "").strip()
+        return completed, cleaned
+
+    def _result_with_report_hint(self, info: SubagentInfo, result: str) -> str:
+        """给主 agent 的结果附加报告缓存路径提示。"""
+        report_path = self._report_relpath(info)
+        if not report_path:
+            return result
+        result = result.strip()
+        if result:
+            return (
+                f"{result}\n\n"
+                f"完整过程与完整报告已实时保存到缓存文件：{report_path}"
+            )
+        return f"完整过程与完整报告已实时保存到缓存文件：{report_path}"
+
+    async def _wait_for_next_instruction(
+        self,
+        info: SubagentInfo,
+        messages: list[dict[str, Any]],
+        task_id: str,
+    ) -> None:
+        """在未完成时保持子 agent 存活，等待新的监督指令。"""
+        logger.info("Subagent [{}] waiting for follow-up instruction", task_id)
+        try:
+            msg = await info.inbox.get()
+        except asyncio.CancelledError:
+            raise
+        messages.append({
+            "role": "user",
+            "content": f"[New instruction]: {msg}",
+        })
+        self._append_report_event(info, "followup_instruction", msg)
+        logger.info("Subagent [{}] woke up: {}", task_id, msg[:100])
+        info.iteration = 0
+
+    async def _deliver_followup_result(
+        self,
+        info: SubagentInfo,
+        content: str,
+    ) -> None:
+        """子 agent 未完成时，向父 agent 发送简短结论并保持存活。"""
+        parent_session_key = (
+            f"{info.origin['channel']}:{info.origin['chat_id']}"
+            if info.origin else None
+        )
+
+        if info.report_mode == ReportMode.SILENT:
+            logger.debug(
+                "Subagent [{}] interim result suppressed (silent mode)",
+                info.task_id,
+            )
+            return
+
+        result_text = (
+            f"[Subagent '{info.label}' reported progress and is waiting for follow-up]\n\n"
+            f"{content}"
+        )
+
+        event_log = self._resolve_event_log(parent_session_key)
+        if event_log is not None:
+            event_log.append(RealtimeEvent.create(
+                source_id=info.task_id,
+                source_label=info.label,
+                event_type=RealtimeEventType.RESULT,
+                payload=result_text,
+                task_id=info.task_id,
+                iteration=info.iteration,
+                max_iterations=info.max_iterations,
+                status="waiting_followup",
+            ))
+
+        if info.report_mode == ReportMode.PEER_ONLY:
+            logger.debug(
+                "Subagent [{}] interim result to EventLog only (peer_only mode)",
+                info.task_id,
+            )
+            return
+
+        wake_content = (
+            f"[Subagent '{info.label}' is waiting for follow-up]\n\n"
+            f"Result:\n{content}\n\n"
+            f"This agent is still alive. If needed, send more instructions with subagent_message."
+        )
+        msg = InboundMessage(
+            channel="system",
+            sender_id="subagent",
+            chat_id=f"{info.origin['channel']}:{info.origin['chat_id']}",
+            content=wake_content,
+            metadata={
+                "_subagent_result": True,
+                "_waiting_followup": True,
+                "task_id": info.task_id,
+            },
+            session_key_override=parent_session_key,
+        )
+        await self.bus.publish_inbound(msg)
 
     def set_parent_tools(self, tools: ToolRegistry) -> None:
         """设置/更新主 agent 的工具注册表 (在工具注册完毕后调用)。"""
@@ -208,7 +369,19 @@ class SubagentManager:
             persistent=persistent,
             depth=depth,
         )
+        info.report_file_path = str(self._build_report_path(info))
         self._agents[task_id] = info
+        self._append_report_event(
+            info,
+            "spawn",
+            {
+                "task": task,
+                "model": resolved_model,
+                "tools": tool_registry.tool_names,
+                "report_mode": mode.value,
+                "origin": origin,
+            },
+        )
 
         # 启动后台任务
         bg_task = asyncio.create_task(
@@ -242,7 +415,8 @@ class SubagentManager:
         return (
             f"Subagent [{display_label}] started (id: {task_id}).\n"
             f"Model: {info.model} | Tools: {', '.join(tool_registry.tool_names)} | "
-            f"Report: {mode.value} | Max iterations: {max_iterations}"
+            f"Report: {mode.value} | Max iterations: {max_iterations} | "
+            f"Trace file: {self._report_relpath(info) or info.report_file_path}"
         )
 
     # ── 消息通道 ──────────────────────────────────────────────────
@@ -256,6 +430,7 @@ class SubagentManager:
             return f"Error: subagent {task_id} is {info.state.value}"
 
         info.inbox.put_nowait(message)
+        self._append_report_event(info, "supervisor_message", message)
         logger.info("Sent message to subagent [{}]: {}", task_id, message[:100])
         return f"Message delivered to subagent [{info.label}] (will be processed before next iteration)"
 
@@ -370,6 +545,7 @@ class SubagentManager:
                 "model": info.model,
                 "iteration": f"{info.iteration}/{info.max_iterations}",
                 "report_mode": info.report_mode.value,
+                "report_file": self._report_relpath(info),
                 "tools": info.tool_names,
                 "recent_tools_used": info.tools_used[-5:],
                 "has_pending_messages": not info.inbox.empty(),
@@ -551,16 +727,37 @@ class SubagentManager:
             ]
             # 将消息列表引用存到 info 上, 供外部 (Dashboard) 读取
             info.messages = messages
+            self._append_report_event(info, "system_prompt", system_prompt)
+            self._append_report_event(info, "user_task", info.task)
 
             final_result: str | None = None
+            completed_with_signal = False
 
-            while info.iteration < info.max_iterations:
+            while True:
                 # ── 暂停检查 ──
                 await info.pause_event.wait()
 
                 # ── 取消检查 ──
                 if info.state == SubagentState.CANCELLED:
                     break
+
+                # ── 达到迭代上限时，不自动销毁，改为等待后续指令 ──
+                if info.iteration >= info.max_iterations:
+                    waiting_result = self._result_with_report_hint(
+                        info,
+                        (
+                            f"Reached max iterations ({info.max_iterations}). "
+                            f"Last tools used: {info.tools_used[-3:]}"
+                        ),
+                    )
+                    self._append_report_event(
+                        info,
+                        "max_iterations_reached",
+                        waiting_result,
+                    )
+                    await self._deliver_followup_result(info, waiting_result)
+                    await self._wait_for_next_instruction(info, messages, task_id)
+                    continue
 
                 # ── 处理收件箱 (主 agent 的纠正消息) ──
                 corrections_injected = False
@@ -571,6 +768,7 @@ class SubagentManager:
                             "role": "user",
                             "content": f"[Correction from supervisor]: {correction}",
                         })
+                        self._append_report_event(info, "correction", correction)
                         corrections_injected = True
                         logger.info(
                             "Subagent [{}] received correction: {}",
@@ -645,6 +843,13 @@ class SubagentManager:
                     if response.reasoning_content:
                         assistant_msg["reasoning_content"] = response.reasoning_content
                     messages.append(assistant_msg)
+                    self._append_report_event(
+                        info,
+                        "assistant_tool_call",
+                        response.content or "",
+                        tool_calls=tool_call_dicts,
+                        reasoning=response.reasoning_content or "",
+                    )
 
                     # 执行工具并收集结果
                     tool_results: list[tuple[str, str]] = []
@@ -667,6 +872,13 @@ class SubagentManager:
                         })
                         info.tools_used.append(tc.name)
                         tool_results.append((tc.name, result))
+                        self._append_report_event(
+                            info,
+                            "tool_result",
+                            result,
+                            tool_name=tc.name,
+                            tool_args=tc.arguments,
+                        )
 
                     # 进度回传: on_tool_call / every_step
                     if info.report_mode in (
@@ -692,11 +904,21 @@ class SubagentManager:
                     if response.reasoning_content:
                         assistant_reply["reasoning_content"] = response.reasoning_content
                     messages.append(assistant_reply)
+                    self._append_report_event(
+                        info,
+                        "assistant_message",
+                        response.content,
+                        reasoning=response.reasoning_content or "",
+                    )
+
+                    completed_with_signal, cleaned_content = self._extract_completion_signal(
+                        response.content,
+                    )
 
                     # 进度回传: every_step
                     if info.report_mode == ReportMode.EVERY_STEP:
-                        preview = response.content[:300]
-                        if len(response.content) > 300:
+                        preview = cleaned_content[:300]
+                        if len(cleaned_content) > 300:
                             preview += "..."
                         await self._report_progress(
                             info,
@@ -707,32 +929,32 @@ class SubagentManager:
                     if info.persistent:
                         # ── persistent agent: 不退出，将结果推送给父 agent 后等待新指令 ──
                         await self._deliver_persistent_result(
-                            info, response.content,
+                            info, cleaned_content,
                         )
                         logger.info(
                             "Persistent subagent [{}] entering idle wait",
                             task_id,
                         )
-                        # 阻塞等待 inbox 消息（取消时会抛出 CancelledError）
-                        try:
-                            msg = await info.inbox.get()
-                        except asyncio.CancelledError:
-                            raise
-                        messages.append({
-                            "role": "user",
-                            "content": f"[New instruction]: {msg}",
-                        })
-                        logger.info(
-                            "Persistent subagent [{}] woke up: {}",
-                            task_id, msg[:100],
-                        )
-                        # 重置迭代计数器，防止 idle 唤醒后被 max_iterations 限制
-                        info.iteration = 0
+                        await self._wait_for_next_instruction(info, messages, task_id)
                         continue
                     else:
-                        # 普通 agent: 无工具调用 = 最终回答
-                        final_result = response.content
-                        break
+                        if completed_with_signal:
+                            # 普通 agent: 收到终止符，任务完成
+                            final_result = cleaned_content
+                            break
+
+                        # 普通 agent: 未收到终止符，保持存活等待后续指令
+                        waiting_result = self._result_with_report_hint(
+                            info, cleaned_content,
+                        )
+                        self._append_report_event(
+                            info,
+                            "waiting_followup",
+                            waiting_result,
+                        )
+                        await self._deliver_followup_result(info, waiting_result)
+                        await self._wait_for_next_instruction(info, messages, task_id)
+                        continue
                 else:
                     if info.persistent:
                         # persistent agent 空响应也不退出
@@ -741,22 +963,21 @@ class SubagentManager:
                             "waiting for inbox",
                             task_id,
                         )
-                        try:
-                            msg = await info.inbox.get()
-                        except asyncio.CancelledError:
-                            raise
-                        messages.append({
-                            "role": "user",
-                            "content": f"[New instruction]: {msg}",
-                        })
-                        info.iteration = 0
+                        await self._wait_for_next_instruction(info, messages, task_id)
                         continue
                     else:
-                        # 空响应
-                        final_result = (
-                            "Task completed but no final response was generated."
+                        waiting_result = self._result_with_report_hint(
+                            info,
+                            "No final response was generated. Please provide follow-up instructions.",
                         )
-                        break
+                        self._append_report_event(
+                            info,
+                            "empty_response_waiting_followup",
+                            waiting_result,
+                        )
+                        await self._deliver_followup_result(info, waiting_result)
+                        await self._wait_for_next_instruction(info, messages, task_id)
+                        continue
 
             # ── 循环结束 ──
             if info.state == SubagentState.CANCELLED:
@@ -764,21 +985,32 @@ class SubagentManager:
                 return
 
             if final_result is None:
-                final_result = (
-                    f"Reached max iterations ({info.max_iterations}). "
-                    f"Last tools used: {info.tools_used[-3:]}"
-                )
+                final_result = "Task completed."
 
-            info.state = SubagentState.COMPLETED
-            logger.info("Subagent [{}] completed successfully", task_id)
-            await self._announce_result(info, final_result, "ok")
+            final_result = self._result_with_report_hint(info, final_result)
+            if completed_with_signal:
+                info.state = SubagentState.COMPLETED
+                info.unregister_on_finish = True
+                self._append_report_event(info, "mission_complete", final_result)
+                logger.info("Subagent [{}] completed successfully", task_id)
+                await self._announce_result(info, final_result, "ok")
+            else:
+                info.state = SubagentState.FAILED
+                self._append_report_event(info, "stopped_without_mission_complete", final_result)
+                logger.warning(
+                    "Subagent [{}] stopped without completion token {}",
+                    task_id, self._MISSION_COMPLETE_TOKEN,
+                )
+                await self._announce_result(info, final_result, "incomplete")
 
         except asyncio.CancelledError:
             info.state = SubagentState.CANCELLED
+            self._append_report_event(info, "cancelled", "Task cancelled")
             logger.info("Subagent [{}] cancelled", task_id)
         except Exception as e:
             info.state = SubagentState.FAILED
             error_msg = f"Error: {e}"
+            self._append_report_event(info, "exception", error_msg)
             logger.error("Subagent [{}] failed: {}", task_id, e)
 
             # on_error / on_tool_call / every_step 都回传错误
@@ -787,7 +1019,11 @@ class SubagentManager:
                     info, f"⚠️ Error encountered: {error_msg}",
                 )
 
-            await self._announce_result(info, error_msg, "error")
+            await self._announce_result(
+                info,
+                self._result_with_report_hint(info, error_msg),
+                "error",
+            )
 
     # ── 持久 agent 结果推送 ───────────────────────────────────────
 
@@ -952,7 +1188,12 @@ class SubagentManager:
         - PEER_ONLY: 仅写 EventLog，不 wake。
         - 其他: EventLog + wake。
         """
-        status_text = "completed successfully" if status == "ok" else "failed"
+        if status == "ok":
+            status_text = "completed successfully"
+        elif status == "incomplete":
+            status_text = "stopped without MISSION_COMPLETE"
+        else:
+            status_text = "failed"
         parent_session_key = (
             f"{info.origin['channel']}:{info.origin['chat_id']}"
             if info.origin else None
@@ -1101,7 +1342,7 @@ class SubagentManager:
 
     # ── 默认系统提示 ──────────────────────────────────────────────
 
-    def _build_subagent_prompt(self, task: str, tools: ToolRegistry) -> str:
+    def _build_subagent_prompt(self, task: str, tools: ToolRegistry, info: SubagentInfo) -> str:
         """为子 agent 生成默认系统提示。"""
         from datetime import datetime
         import time as _time
@@ -1109,6 +1350,7 @@ class SubagentManager:
         now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
         tz = _time.strftime("%Z") or "UTC"
         tool_list = ", ".join(tools.tool_names) if tools.tool_names else "none"
+        report_path = self._report_relpath(info) or (info.report_file_path or "unknown")
 
         return f"""# Subagent
 
@@ -1120,14 +1362,26 @@ You are a subagent spawned by the main agent to complete a specific task.
 ## Available Tools
 {tool_list}
 
+## Report Cache File
+Your full transcript, tool outputs, and execution trace are being streamed in real time to:
+{report_path}
+
 ## Rules
 1. Stay focused — complete only the assigned task, nothing else
 2. Your final response will be reported back to the main agent
 3. If you receive a "[Correction from supervisor]" message, adjust your approach accordingly
-4. Be concise but informative in your findings
+4. Your final reply must contain only the final conclusion, not the full process
 5. If a tool fails, try alternative approaches before giving up
+6. Do not dump long transcripts or tool outputs in the final reply; they already exist in the report cache file
+7. Only when the task is truly finished, include the exact standalone token MISSION_COMPLETE in your final reply
+8. If the task is blocked, incomplete, or needs follow-up, do NOT include MISSION_COMPLETE
+9. When you finish successfully, tell the main agent that the complete report and full process are stored in the cache file above
+10. For file operations, treat .cache as the default working directory and prefer paths relative to .cache (no absolute path needed)
 
 ## Workspace
 Your workspace is at: {self.workspace}
 
-When you have completed the task, provide a clear summary of your findings or actions."""
+When you have completed the task successfully, respond in this style:
+- one short conclusion paragraph
+- one short line saying the full report is stored in the cache file above
+- final line: MISSION_COMPLETE"""

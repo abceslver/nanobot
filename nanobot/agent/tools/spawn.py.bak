@@ -95,6 +95,7 @@ class SpawnTool(Tool):
                     "items": {"type": "string"},
                     "description": (
 "Tool names to enable. If omitted, no tools are enabled by default."
+                        "are enabled (except spawn/management tools). "
                         "Example: [\"tavily_search\", \"read_file\"]"
                     ),
                 },
