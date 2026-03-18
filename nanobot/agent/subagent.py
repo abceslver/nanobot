@@ -719,7 +719,7 @@ class SubagentManager:
         try:
             # 构建初始消息
             system_prompt = custom_system_prompt or self._build_subagent_prompt(
-                info.task, tools,
+                info.task, tools, info,
             )
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
